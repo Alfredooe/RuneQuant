@@ -11,6 +11,17 @@ services:
       - MONGO_URI=mongodb://root:example@mongo:27017/
       - MONGO_DB=runequant
   
+  zamorak:
+    build:
+      context: ./zamorak
+      dockerfile: Dockerfile
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://root:example@mongo:27017/
+      - MONGO_DB=runequant
+  
   mongo:
     image: mongo
     restart: always

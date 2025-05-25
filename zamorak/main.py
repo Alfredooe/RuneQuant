@@ -1,6 +1,8 @@
 import pandas as pd
 import os
 import logging
+import numpy as np
+import json
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 
@@ -11,6 +13,31 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('zamorak')
+
+def load_item_mapping():
+    """
+    Load item mapping from mapping.json file and create lookup dict for non-member items
+    """
+    try:
+        with open('mapping.json', 'r') as f:
+            items = json.load(f)
+            
+        # Create a lookup dict of non-member items
+        non_member_items = {}
+        for item in items:
+            if 'members' in item and item['members'] == False:
+                if 'id' in item:
+                    non_member_items[str(item['id'])] = {
+                        'name': item.get('name', 'Unknown'),
+                        'limit': item.get('limit', 0),
+                        'value': item.get('value', 0)
+                    }
+        
+        logger.info(f"Loaded {len(non_member_items)} non-member items from mapping.json")
+        return non_member_items
+    except Exception as e:
+        logger.error(f"Error loading item mapping: {e}")
+        return {}
 
 def get_mongo_client():
     """Create a connection to MongoDB."""
@@ -33,12 +60,13 @@ def get_mongo_client():
     logger.error("Failed to connect to MongoDB after multiple attempts")
     return None
 
-def get_price_data(days=7, item_id=None):
+def get_price_data(hours=3, days=None, item_id=None):
     """
     Retrieve price data from MongoDB and convert to DataFrame.
     
     Args:
-        days (int): Number of days of data to retrieve
+        hours (int, optional): Number of hours of data to retrieve
+        days (int, optional): Number of days of data to retrieve
         item_id (str, optional): Specific item ID to filter by
     
     Returns:
@@ -57,7 +85,10 @@ def get_price_data(days=7, item_id=None):
         
         # Build query with date filter
         query = {}
-        if days:
+        if hours:
+            cutoff_date = datetime.now() - timedelta(hours=hours)
+            query['collection_time'] = {'$gte': cutoff_date}
+        elif days:
             cutoff_date = datetime.now() - timedelta(days=days)
             query['collection_time'] = {'$gte': cutoff_date}
         
@@ -83,86 +114,200 @@ def get_price_data(days=7, item_id=None):
     finally:
         client.close()
 
-def analyze_price_trends(df):
+def get_historical_gold_per_second(days=14, non_member_items=None):
     """
-    Basic price trend analysis on the data.
+    Calculate the historical gold per second for each item over the past two weeks.
     
     Args:
-        df (pd.DataFrame): DataFrame with price data
-    
+        days (int): Number of days to look back for historical data
+        non_member_items (dict): Dictionary of non-member items
+        
     Returns:
-        pd.DataFrame: DataFrame with trend analysis
+        pd.DataFrame: DataFrame with item_id and gold_per_second
     """
-    if df.empty:
-        logger.warning("No data available for analysis")
-        return df
+    # Get two weeks of historical data
+    historical_df = get_price_data(days=days)
     
-    # Group by item_id and item_name
+    if historical_df.empty:
+        logger.warning("No historical data available for gold/second calculation")
+        return pd.DataFrame()
+    
     try:
-        grouped = df.groupby(['item_id', 'item_name']).agg({
-            'high_price_1h': ['mean', 'min', 'max', 'std'],
-            'low_price_1h': ['mean', 'min', 'max', 'std'],
-            'high_volume_1h': ['sum', 'mean'],
-            'low_volume_1h': ['sum', 'mean'],
-            'collection_time': ['min', 'max', 'count']
-        })
+        # Make sure collection_time is datetime
+        historical_df['collection_time'] = pd.to_datetime(historical_df['collection_time'])
         
-        # Flatten multi-level column names
-        grouped.columns = ['_'.join(col).strip() for col in grouped.columns.values]
+        # Filter for non-member items only if we have the mapping
+        if non_member_items:
+            historical_df = historical_df[historical_df['item_id'].astype(str).isin(non_member_items.keys())]
+            logger.info(f"Filtered down to {len(historical_df)} non-member item records")
         
-        # Calculate price volatility (coefficient of variation)
-        grouped['high_price_volatility'] = grouped['high_price_1h_std'] / grouped['high_price_1h_mean']
-        grouped['low_price_volatility'] = grouped['low_price_1h_std'] / grouped['low_price_1h_mean']
+        # Group by item_id and calculate metrics
+        grouped = historical_df.groupby(['item_id', 'item_name']).apply(
+            lambda x: pd.Series({
+                'total_high_value': (x['high_price_1h'] * x['high_volume_1h']).sum(),
+                'total_low_value': (x['low_price_1h'] * x['low_volume_1h']).sum(),
+                'first_date': x['collection_time'].min(),
+                'last_date': x['collection_time'].max(),
+            })
+        ).reset_index()
         
-        # Calculate spread between high and low prices
-        grouped['avg_spread'] = grouped['high_price_1h_mean'] - grouped['low_price_1h_mean']
-        grouped['avg_spread_pct'] = (grouped['avg_spread'] / grouped['low_price_1h_mean']) * 100
+        # Calculate time span in seconds
+        grouped['time_span_seconds'] = (grouped['last_date'] - grouped['first_date']).dt.total_seconds()
         
-        # Calculate date range
-        grouped['days_covered'] = (grouped['collection_time_max'] - grouped['collection_time_min']).dt.total_seconds() / (60 * 60 * 24)
+        # Avoid division by zero
+        grouped['time_span_seconds'] = grouped['time_span_seconds'].replace(0, 1)
         
-        return grouped.reset_index().sort_values('avg_spread_pct', ascending=False)
+        # Calculate gold per second (average of high and low values)
+        grouped['gold_per_second'] = ((grouped['total_high_value'] + grouped['total_low_value']) / 2) / grouped['time_span_seconds']
+        
+        return grouped[['item_id', 'item_name', 'gold_per_second']]
         
     except Exception as e:
-        logger.error(f"Error analyzing price data: {e}")
+        logger.error(f"Error calculating historical gold per second: {e}")
+        return pd.DataFrame()
+
+def analyze_items(hours=3, min_low_volume=5, non_member_items=None):
+    """
+    Analyze items based on ROI and volume ratio over the specified hours of data.
+    
+    Args:
+        hours (int): Number of hours of recent data to analyze
+        min_low_volume (int): Minimum low_volume_1h to consider an item viable
+        non_member_items (dict): Dictionary of non-member items
+        
+    Returns:
+        pd.DataFrame: DataFrame with analysis results
+    """
+    # Get recent data (last 3 hours)
+    recent_df = get_price_data(hours=hours)
+    
+    if recent_df.empty:
+        logger.warning(f"No data available for the last {hours} hours")
+        return pd.DataFrame()
+    
+    try:
+        # Make sure collection_time is datetime
+        recent_df['collection_time'] = pd.to_datetime(recent_df['collection_time'])
+        
+        # Filter for non-member items only if we have the mapping
+        if non_member_items:
+            recent_df = recent_df[recent_df['item_id'].astype(str).isin(non_member_items.keys())]
+            logger.info(f"Filtered down to {len(recent_df)} non-member item records")
+            
+            # Add item limit from mapping
+            recent_df['item_limit'] = recent_df['item_id'].astype(str).map(
+                lambda x: non_member_items.get(x, {}).get('limit', 0)
+            )
+        
+        # Get the most recent data for each item (for 5-minute price spread)
+        recent_prices = recent_df.sort_values('collection_time').groupby('item_id').last().reset_index()
+        
+        # Calculate ROI with 1% tax
+        recent_prices['sell_total'] = recent_prices['high_price_1h']
+        recent_prices['buy_total'] = recent_prices['low_price_1h']
+        recent_prices['tax_amount'] = recent_prices['sell_total'] * 0.01  # 1% tax
+        recent_prices['roi'] = (recent_prices['sell_total'] - recent_prices['tax_amount'] - recent_prices['buy_total']) / recent_prices['buy_total']
+        
+        # Calculate volume ratio
+        recent_prices['volume_ratio'] = recent_prices['high_volume_1h'] / recent_prices['low_volume_1h'].replace(0, 1)  # Avoid division by zero
+        
+        # Get historical gold/second data
+        gold_per_second_df = get_historical_gold_per_second(days=14, non_member_items=non_member_items)
+        
+        if gold_per_second_df.empty:
+            logger.warning("No historical gold/second data available")
+            # Continue without gold/second filter
+            merged_df = recent_prices
+        else:
+            # Merge with historical data
+            merged_df = pd.merge(recent_prices, gold_per_second_df, on=['item_id', 'item_name'], how='left')
+            # Fill missing gold_per_second with 0
+            merged_df['gold_per_second'] = merged_df['gold_per_second'].fillna(0)
+        
+        # Filter out items with insufficient low volume trading
+        merged_df = merged_df[merged_df['low_volume_1h'] >= min_low_volume]
+        
+        # Calculate Z-scores
+        merged_df['roi_zscore'] = (merged_df['roi'] - merged_df['roi'].mean()) / merged_df['roi'].std(ddof=0)
+        merged_df['volume_ratio_zscore'] = (merged_df['volume_ratio'] - merged_df['volume_ratio'].mean()) / merged_df['volume_ratio'].std(ddof=0)
+        
+        # Replace NaN z-scores with 0 (happens when std is 0)
+        merged_df['roi_zscore'] = merged_df['roi_zscore'].fillna(0)
+        merged_df['volume_ratio_zscore'] = merged_df['volume_ratio_zscore'].fillna(0)
+        
+        # Calculate combined score
+        merged_df['combined_score'] = merged_df['roi_zscore'] + merged_df['volume_ratio_zscore']
+        
+        # Filter out items with negative gold/second
+        result_df = merged_df[merged_df['gold_per_second'] >= 0]
+        
+        # Filter out rows with ANY NaN values
+        result_df = result_df.dropna()
+        
+        # Sort by combined score descending
+        result_df = result_df.sort_values('combined_score', ascending=False)
+        
+        # Calculate expected profit per hour
+        result_df['max_trades_per_hour'] = result_df['low_volume_1h']
+        result_df['profit_per_trade'] = (result_df['high_price_1h'] * 0.99) - result_df['low_price_1h']
+        result_df['expected_profit_per_hour'] = result_df['profit_per_trade'] * result_df['max_trades_per_hour']
+        
+        # Add limitation-based calculations
+        if 'item_limit' in result_df.columns:
+            # Calculate how many trades can be done considering GE limits
+            result_df['trades_per_limit'] = result_df['item_limit'].clip(lower=1)  # Ensure no zeros
+            result_df['profit_per_limit'] = result_df['profit_per_trade'] * result_df['trades_per_limit']
+            
+        return result_df
+    
+    except Exception as e:
+        logger.error(f"Error analyzing items: {e}")
         return pd.DataFrame()
 
 def main():
-    logger.info("ZAMORAK LOADED")
+    logger.info("Starting Zamorak - OSRS GE Analysis")
     
-    # Get price data for the last 7 days
-    df = get_price_data(days=7)
+    # Load non-member item mapping
+    non_member_items = load_item_mapping()
     
-    if df.empty:
-        logger.error("No data retrieved from MongoDB. Exiting.")
+    # Analyze items based on the last 3 hours of data with minimum low volume of 5
+    # Pass non_member_items to filter out member-only items
+    results = analyze_items(hours=3, min_low_volume=500, non_member_items=non_member_items)
+    
+    if results.empty:
+        logger.error("No analysis results available. Exiting.")
         return
     
-    # Print basic stats
-    print(f"Successfully loaded {len(df)} records for {df['item_id'].nunique()} unique items")
+    # Print results
+    print(f"Successfully analyzed {len(results)} items")
     
-    # Perform trend analysis
-    trends_df = analyze_price_trends(df)
+    # Display analysis results
+    with pd.option_context(
+        'display.max_columns', None,
+        'display.width', None,
+        'display.precision', 4,
+        'display.float_format', lambda x: f"{x:.4f}" if abs(x) < 1000000 else f"{x:.0f}"
+    ):
+        print("\nTop 20 Items by Combined Score (ROI Z-score + Volume Ratio Z-score):")
+        
+        # Select and format columns for display, now including 5m prices
+        display_cols = [
+            'item_id', 'item_name', 'combined_score', 'roi', 
+            'volume_ratio', 'low_volume_1h', 'high_volume_1h',
+            'expected_profit_per_hour', 'profit_per_trade',
+            'high_price_1h', 'low_price_1h',  # 1h prices
+            'high_price_5m', 'low_price_5m'   # Added 5m prices
+        ]
+        
+        print(results[display_cols].head(20))
+        
+        # Also show top items sorted by expected profit per hour
+        profit_sorted = results.sort_values('expected_profit_per_hour', ascending=False)
+        
+        print("\nTop 20 Items by Expected Profit Per Hour:")
+        print(profit_sorted[display_cols].head(20))
     
-    if not trends_df.empty:
-        # Display top 10 items by spread percentage
-        print("\nTop 10 Items by Price Spread %")
-        print(trends_df[['item_name', 'high_price_1h_mean', 'low_price_1h_mean', 
-                        'avg_spread', 'avg_spread_pct', 'high_volume_1h_sum', 
-                        'low_volume_1h_sum']].head(10))
-        
-        # Display top 10 items by trading volume
-        volume_df = trends_df.sort_values('high_volume_1h_sum', ascending=False)
-        print("\nTop 10 Items by Trading Volume")
-        print(volume_df[['item_name', 'high_price_1h_mean', 'high_volume_1h_sum', 
-                         'low_volume_1h_sum', 'avg_spread_pct']].head(10))
-        
-        # Display top 10 items by price volatility
-        volatile_df = trends_df.sort_values('high_price_volatility', ascending=False)
-        print("\nTop 10 Items by Price Volatility")
-        print(volatile_df[['item_name', 'high_price_1h_mean', 'high_price_volatility', 
-                          'low_price_volatility', 'high_volume_1h_sum']].head(10))
-    else:
-        logger.warning("No trend analysis available")
+    return results  # Return the DataFrame for interactive use or further analysis
 
 
 if __name__ == "__main__":
