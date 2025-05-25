@@ -1,0 +1,44 @@
+version: '3.8'
+services:
+  grandexchange:
+    build:
+      context: ./grandexchange
+      dockerfile: Dockerfile
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://root:example@mongo:27017/
+      - MONGO_DB=runequant
+  
+  mongo:
+    image: mongo
+    restart: always
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "if (db.adminCommand('ping').ok) { exit(0) } else { exit(1) }"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  mongo-express:
+    image: mongo-express
+    restart: always
+    ports:
+      - 8081:8081
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: root
+      ME_CONFIG_MONGODB_ADMINPASSWORD: example
+      ME_CONFIG_MONGODB_URL: mongodb://root:example@mongo:27017/admin
+      ME_CONFIG_BASICAUTH: false
+
+volumes:
+  mongodb_data:
